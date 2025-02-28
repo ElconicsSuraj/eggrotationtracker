@@ -1,0 +1,144 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// ThingsBoard credentials
+const char* thingsboardServer = "devices.dev.antzsystems.com";
+const char* thingsboardToken = "UI7havXAnRZfcqaipxwG";  // Replace with actual token
+
+//const char* serverName = "http://devices.dev.antzsystems.com/api/v1/UI7havXAaipxwG/telemetry"; 
+
+// WiFi credentials
+const char* ssid = "VANTARA_IOT";
+const char* password = "1234567890";
+
+// MQTT Broker
+const char* mqtt_server = "broker.emqx.io";  
+
+WiFiClient espClient;      // For HTTP requests
+WiFiClient wifiClient;     // Separate client for MQTT
+PubSubClient client(mqtt_server, 1883, wifiClient);
+Adafruit_MPU6050 mpu;
+
+// I2C Pins
+#define SDA_PIN 4  // GPIO4 (D2)
+#define SCL_PIN 5  // GPIO5 (D1)
+
+void setup() {
+  Serial.begin(115200);
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+
+  // Set up MQTT client
+  client.setServer(mqtt_server, 1883);
+
+  // Initialize I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not detected!");
+    while (1) delay(10);
+  }
+  Serial.println("MPU6050 Initialized!");
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.println("Attempting MQTT connection...");
+    if (client.connect("ESP8266_Client")) {
+      Serial.println("Connected to MQTT broker!");
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 5 seconds...");
+      delay(5000);
+    }
+  }
+}
+
+void sendDataToThingsBoard(float temperature, float x, float y, float z) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;  // HTTP client for ThingsBoard
+    
+    Serial.println("Connecting to ThingsBoard...");
+    if (!client.connect(thingsboardServer, 8080)) {
+      Serial.println("Connection to ThingsBoard failed!");
+      return;
+    }
+
+    // Create JSON payload
+    StaticJsonDocument<200> doc;
+    doc["temperature"] = temperature;
+    doc["x"] = x;
+    doc["y"] = y;
+    doc["z"] = z;
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    // Send HTTP POST request
+    client.println("POST /api/v1/" + String(thingsboardToken) + "/telemetry HTTP/1.1");
+    client.println("Host: " + String(thingsboardServer));
+    client.println("Content-Type: application/json");
+    client.println("Content-Length: " + String(jsonString.length()));
+    client.println();
+    client.println(jsonString);
+
+    // Read response
+    unsigned long timeout = millis();
+    while (client.available() == 0) {
+      if (millis() - timeout > 5000) {
+        Serial.println(">>> Client Timeout!");
+        client.stop();
+        return;
+      }
+    }
+
+    // Print response
+    while (client.available()) {
+      Serial.write(client.read());
+    }
+    
+    client.stop();
+  } else {
+    Serial.println("WiFi Disconnected, unable to send data!");
+  }
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  // Read sensor data
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // Create JSON for MQTT
+  StaticJsonDocument<200> doc;
+  doc["x"] = a.acceleration.x;
+  doc["y"] = a.acceleration.y;
+  doc["z"] = a.acceleration.z;
+
+  char jsonBuffer[512];
+  serializeJson(doc, jsonBuffer);
+
+  // Publish data to MQTT broker
+  client.publish("downlink/rotation", jsonBuffer);
+
+  // Send data to ThingsBoard via HTTP
+  sendDataToThingsBoard(temp.temperature, a.acceleration.x, a.acceleration.y, a.acceleration.z);
+
+  delay(500);  // Delay 5 seconds before next cycle
+}
